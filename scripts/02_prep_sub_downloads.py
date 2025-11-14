@@ -1,8 +1,10 @@
 import argparse as ap
 from download_data.get_downloads_info import save_run_ends
-from paths.pathsval import project_root, runends_directory, fastq_directory
+from paths.pathsval import project_root, runends_directory, fastq_directory, sampletable_directory
 from utils.job_submission import submit_fasterqdump_job
 from download_data.get_downloads_info import run_end
+from download_data.check_download_files import check_paired_files, check_single_files, save_sample_sheet
+
 import pandas as pd
 
 parser = ap.ArgumentParser(
@@ -22,29 +24,51 @@ parser.add_argument("-g", "--gse",
                     nargs="+",
                     help="Lista de GSEs separados por comas (e.g., GSE12345,GSE67890). " \
                     "Solo requerido si el tipo es 'GEO'.")
+parser.add_argument("--gsm",
+                    required=False,
+                    nargs="+",
+                    help="Lista de GSMs separados por comas (e.g., GSM12345,GSM67890). " \
+                    "Solo requerido si el tipo es 'GEO'. O se quieren descargar muestras específicas.")
 args = parser.parse_args()
 
-def process_runs(paired_path, single_path, paired_script, single_script, fq_output_dir):
+def process_runs(paired_path, single_path, paired_script, single_script, fq_output_dir, processing_prefix, root, paired_df, single_df):
 
     paired_exists = paired_path is not None and paired_path.exists()
     single_exists = single_path is not None and single_path.exists()
+
+    all_verified_rows = []
+    st_dir = sampletable_directory(root , args.bioproject)
 
     if not paired_exists and not single_exists:
         raise RuntimeError("No se crearon archivos de salida. No se mandaron trabajos de descarga.")
 
     if paired_exists and not single_exists:
-        print("Solo se crearon archivos de pares. Se mandarán trabajos de descarga para pares.")
-        submit_fasterqdump_job(f"{args.bioproject}_paired_download", paired_script, paired_path, fq_output_dir, wait_for=False)
+        print("Solo se crearon archivos de pares. Se mandarán trabajos de descarga para pares.El script entrara en tiempo de espera...")
+        submit_fasterqdump_job(f"{processing_prefix}_paired_download", paired_script, paired_path, fq_output_dir, wait_for=True)
+        print(f"Descarga Paired-End para {processing_prefix} terminada. Verificando archivos...")
+        all_verified_rows= check_paired_files(paired_df['SRR'], fq_output_dir)
 
     if single_exists and not paired_exists:
-        print("Solo se crearon archivos de simples. Se mandarán trabajos de descarga para simples.")
-        submit_fasterqdump_job(f"{args.bioproject}_single_download", single_script, single_path, fq_output_dir, wait_for=False)
+        print("Solo se crearon archivos de simples. Se mandarán trabajos de descarga para simples. El script entrara en tiempo de espera...")
+        submit_fasterqdump_job(f"{processing_prefix}_single_download", single_script, single_path, fq_output_dir, wait_for=True)
+        print(f"Descarga Single-End para {processing_prefix} terminada. Verificando archivos...")
+        all_verified_rows= check_single_files(single_df['SRR'], fq_output_dir)
 
     if paired_exists and single_exists:
         print("Se crearon archivos de pares y simples. Se mandarán trabajos de descarga para ambos secuencialmente.")
-        submit_fasterqdump_job(f"{args.bioproject}_paired_download", paired_script, paired_path, fq_output_dir, wait_for=True)
-        submit_fasterqdump_job(f"{args.bioproject}_single_download", single_script, single_path, fq_output_dir, wait_for=False)
-        
+        submit_fasterqdump_job(f"{processing_prefix}_paired_download", paired_script, paired_path, fq_output_dir, wait_for=True)
+        submit_fasterqdump_job(f"{processing_prefix}_single_download", single_script, single_path, fq_output_dir, wait_for=True)
+        print(f"Descargas para {processing_prefix} terminadas. Verificando archivos...")
+        # Llama a ambas verificaciones
+        verify_paired= check_paired_files(paired_df['SRR'], fq_output_dir) + check_single_files(single_df['SRR'], fq_output_dir)
+        verify_single= check_single_files(single_df['SRR'], fq_output_dir)
+        all_verified_rows= verify_paired + verify_single
+
+        if all_verified_rows:
+            sample_sheet_path = save_sample_sheet(all_verified_rows, st_dir, processing_prefix)
+            print(f"Hoja de muestras guardada en: {sample_sheet_path}")
+        else:
+            print("No se encontraron archivos válidos para guardar en la hoja de muestras.")
 
 
 def main():
@@ -52,7 +76,7 @@ def main():
     print("Tipo de descarga:", args.type)
     if args.gse:
         print("GSEs:", args.gse)
-        gse_list = ",".join(args.gse)
+        gse_str = ",".join(args.gse)
 
     base_project_path = project_root()
     bpdir = base_project_path / "data"  / args.bioproject
@@ -67,7 +91,6 @@ def main():
 
     if not sra_info_path.is_file():
         raise FileNotFoundError(f"SRA runinfo file not found at {sra_info_path}")
-    
     print (f"Reading SRA runinfo from {sra_info_path}")
     
     try:
@@ -96,7 +119,7 @@ def main():
             raise ValueError(f"Error reading GDS info file: {e}")
 
    
-        for gse in gse_list.split(","):
+        for gse in gse_str.split(","):
             gse = gse.strip()
             gsm_list = df_gse_gsm[df_gse_gsm['GSE'] == gse]['GSM'].tolist()
             sra_subset = sra_df[sra_df['SampleName'].isin(gsm_list)]
@@ -107,18 +130,34 @@ def main():
             paired, single = run_end(sra_subset)
             output_path = runends_directory(base_project_path, args.bioproject)
             paired_path, single_path = save_run_ends(paired, single, output_path, gse)
-            process_runs(paired_path, single_path, paired_script, single_script, fastq_out_dir)
+            process_runs(paired_path, single_path, paired_script, single_script, fastq_out_dir,gse, base_project_path, paired, single)
 
             print(f"Processed {gse}:")
             print(f"  Paired-end runs saved to: {paired_path}")
             print(f"  Single-end runs saved to: {single_path}")
 
+    if args.type == "GSM":
+        gsm_list = [gsm.strip() for gsm in args.gsm]
+        proccesing_prefix =  gsm_list[0] + "-" + gsm_list[-1]
+        sra_subset = sra_df[sra_df['SampleName'].isin(gsm_list)]
+        if sra_subset.empty:
+            raise ValueError("No matching GSM entries found in SRA runinfo.")
+
+        paired, single = run_end(sra_subset)
+        output_path = runends_directory(base_project_path, args.bioproject)
+        paired_path, single_path = save_run_ends(paired, single, output_path,output_path, proccesing_prefix)
+        process_runs(paired_path, single_path, paired_script, single_script, fastq_out_dir, proccesing_prefix,base_project_path, paired, single)
+
+        print(f"Processed selected GSMs:")
+        print(f"  Paired-end runs saved to: {paired_path}")
+        print(f"  Single-end runs saved to: {single_path}")
+        
     elif args.type == "SRA":
          
         paired, single = run_end(sra_df)
         output_path = runends_directory(base_project_path, args.bioproject)
         paired_path, single_path = save_run_ends(paired, single, output_path, args.bioproject)
-        process_runs(paired_path, single_path, paired_script, single_script, fastq_out_dir)
+        process_runs(paired_path, single_path, paired_script, single_script, fastq_out_dir, args.bioproject, base_project_path, paired, single)
 
         print(f"Processed SRA project {args.bioproject}:")
         print(f" Paired-end runs saved to: {paired_path}")

@@ -49,10 +49,22 @@ export OUTPUT_DIR
 echo "Iniciando descargas Paired-end en paralelo..."
 parallel --env OUTPUT_DIR -j 5 \
     '
+    set -e
+
     echo "Iniciando descarga de: {}"
     fasterq-dump --threads 6 --split-files --outdir "$OUTPUT_DIR" {}
     gzip "$OUTPUT_DIR/{}_1.fastq"
     gzip "$OUTPUT_DIR/{}_2.fastq"
+
+    if gunzip -t "$OUTPUT_DIR/{}_1.fastq.gz" && gunzip -t "$OUTPUT_DIR/{}_2.fastq.gz"; then
+        echo "Verificación de {} completada (OK)."
+    else
+        echo "¡ERROR: Archivos para {} están corruptos! Borrando..."
+        # Borra ambos por si acaso uno estaba bien y el otro no
+        rm "$OUTPUT_DIR/{}_1.fastq.gz"
+        rm "$OUTPUT_DIR/{}_2.fastq.gz"
+        exit 1 # Falla explícitamente para detener este trabajo
+    fi
     ' < "$SRR_LIST_FILE"
     
 echo "Todas las descargas paired han sido procesadas."

@@ -49,6 +49,7 @@ export OUTPUT_DIR
 # 4) Ejecuta el proceso principal
 echo "Iniciando descargas Single-end en paralelo..."
 parallel --env OUTPUT_DIR -j 5 '
+    set -e
     SRR={}
     echo "Iniciando descarga de: $SRR"
 
@@ -58,6 +59,15 @@ parallel --env OUTPUT_DIR -j 5 '
         echo "  -> Descargando y comprimiendo $SRR..."
         fasterq-dump --threads 6 --outdir "$OUTPUT_DIR" "$SRR"
         gzip "$OUTPUT_DIR/$SRR.fastq"
+
+        echo "Verificando integridad de: {}.fastq.gz"
+        if gunzip -t "$OUTPUT_DIR/{}.fastq.gz"; then
+            echo "Verificación de {} completada (OK)."
+        else
+            echo "¡ERROR: Archivo {}.fastq.gz está corrupto! Borrando..."
+            rm "$OUTPUT_DIR/{}.fastq.gz"
+            exit 1 # Falla explícitamente para detener este trabajo
+        fi
     fi
 ' < "$SRR_LIST_FILE"
 
